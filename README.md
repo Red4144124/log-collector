@@ -41,7 +41,9 @@ ________________________________________________________________________________
 Выполнить команды:
 
 `systemctl daemon-reload`
+
 `systemctl enable log-collector`
+
 `systemctl start log-collector`
 
 Логи будут размещаться на сервере по пути:
@@ -53,4 +55,7 @@ ________________________________________________________________________________
 /usr/local/bin/rotate_server_logs.sh
 
 `chmod +x /usr/local/bin/rotate_server_logs.sh`
+
+
+`echo "*/30 * * * * /usr/local/bin/rotate_server_logs.sh" | sudo crontab -`
 
