@@ -1,0 +1,33 @@
+{
+  "sources": {
+    "gst_demo": {"file": "/var/log/gst_demo.log", "enabled": true},
+    "hls_stream": {"file": "/var/log/hls_stream.log", "enabled": true},
+    "main_web_server": {"file": "/var/log/main_web_server.log", "enabled": true},
+    "image_encoder": {"file": "/var/log/main_web_server_image_encoder.log", "enabled": true},
+    "sys_settings": {"file": "/var/log/sys_settings.log", "enabled": true},
+    "nvme_trace": {"file": "/media/nvme/trace.log", "enabled": true},
+    "dmesg": {"enabled": true, "type": "command", "command": "dmesg -w -T"},
+    "journal": {"enabled": true, "type": "command", "command": "journalctl -f -o short-full"}
+  },
+  "storage": {
+    "live_dir": "/var/log/live",
+    "archive_dir": "/var/log/collected",
+    "state_dir": "/var/lib/log-collector"
+  },
+  "buffer": {
+    "ring_buffer_lines": 5000,
+    "flush_interval_seconds": 5,
+    "max_file_size_mb": 10
+  },
+  "rotation": {
+    "max_rotated_files": 5,
+    "compress_rotated": true
+  },
+  "remote": {
+    "enabled": true,
+    "scp_target": "loguser@172.16.12.51:/home/loguser/device_logs/",
+    "ssh_key_path": "/root/.ssh/id_dropbear_rsa",
+    "send_interval_minutes": 5,
+    "cleanup_after_send": false
+  }
+}
