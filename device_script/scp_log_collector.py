@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SCP Log Collector - дозапись + ротация + отправка по SCP с Dropbear-ключом
 
 import os
 import sys
@@ -10,6 +9,7 @@ import subprocess
 import json
 import gzip
 import shutil
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -24,8 +24,12 @@ class AppendSCPLogCollector:
         for d in [self.local_live_dir, self.local_archive_dir, self.state_dir]:
             d.mkdir(parents=True, exist_ok=True)
         
-        self.current_files = {}
-        self.current_sizes = {}
+        # Файл для хранения позиций отправки
+        self.state_file = self.state_dir / 'send_positions.json'
+        self.send_positions = self.load_send_positions()
+        
+        self.current_files = {}   # source_name -> file object
+        self.current_sizes = {}   # source_name -> size
         self.ring_buffer = deque(maxlen=self.config['buffer']['ring_buffer_lines'])
         
         self.running = True
@@ -60,8 +64,7 @@ class AppendSCPLogCollector:
                 'enabled': False,
                 'scp_target': '',
                 'ssh_key_path': '',
-                'send_interval_minutes': 5,
-                'cleanup_after_send': False
+                'send_interval_minutes': 5
             }
         }
         if os.path.exists(path):
@@ -77,9 +80,23 @@ class AppendSCPLogCollector:
             else:
                 base[k] = v
     
+    def load_send_positions(self):
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def save_send_positions(self):
+        with open(self.state_file, 'w') as f:
+            json.dump(self.send_positions, f, indent=2)
+    
     def setup_handlers(self):
         def handler(signum, frame):
             print(f"\nSignal {signum}, shutting down...")
+            self.save_send_positions()
             self.emergency_flush()
             self.running = False
             sys.exit(0)
@@ -94,14 +111,18 @@ class AppendSCPLogCollector:
             filepath = self.local_live_dir / filename
             self.current_files[src] = open(filepath, 'a')
             self.current_sizes[src] = filepath.stat().st_size if filepath.exists() else 0
-            print(f"Init {src} -> {filepath} (size {self.current_sizes[src]} bytes)")
+            if src not in self.send_positions:
+                self.send_positions[src] = 0
+            print(f"Init {src} -> {filepath} (size {self.current_sizes[src]} bytes, send_pos {self.send_positions[src]})")
     
     def rotate_file(self, source_name):
         old_path = self.local_live_dir / f"{source_name}.log"
         if not old_path.exists():
             return
         
-        self.current_files[source_name].close()
+        # Закрываем текущий файл
+        if source_name in self.current_files:
+            self.current_files[source_name].close()
         
         max_files = self.config['rotation']['max_rotated_files']
         rotated = sorted(self.local_live_dir.glob(f"{source_name}.log.*"))
@@ -119,15 +140,17 @@ class AppendSCPLogCollector:
         old_path.rename(new_rotated)
         
         if self.config['rotation']['compress_rotated']:
-            with open(new_rotated, 'rb') as f_in:
-                with gzip.open(f"{new_rotated}.gz", 'wb') as f_out:
-                    shutil.copyfileobj(f_in, f_out)
+            with open(new_rotated, 'rb') as f_in, gzip.open(f"{new_rotated}.gz", 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
             new_rotated.unlink()
         
+        # Открываем новый файл
         self.current_files[source_name] = open(old_path, 'a')
         self.current_sizes[source_name] = 0
+        # При ротации сбрасываем позицию отправки
+        self.send_positions[source_name] = 0
         self.stats['rotations'] += 1
-        print(f"Rotated {source_name}")
+        print(f"Rotated {source_name}, reset send position")
     
     def write_log(self, source_name, line, timestamp=None):
         if timestamp is None:
@@ -136,7 +159,7 @@ class AppendSCPLogCollector:
         self.ring_buffer.append(log_line)
         
         fd = self.current_files.get(source_name)
-        if fd:
+        if fd and not fd.closed:
             fd.write(log_line)
             self.current_sizes[source_name] += len(log_line)
             self.stats['lines_written'] += 1
@@ -146,72 +169,103 @@ class AppendSCPLogCollector:
             max_size = self.config['buffer']['max_file_size_mb'] * 1024 * 1024
             if self.current_sizes[source_name] > max_size:
                 self.rotate_file(source_name)
+        else:
+            # Файл закрыт – переоткрываем
+            filename = f"{source_name}.log"
+            filepath = self.local_live_dir / filename
+            self.current_files[source_name] = open(filepath, 'a')
+            self.current_sizes[source_name] = filepath.stat().st_size if filepath.exists() else 0
+            self.write_log(source_name, line, timestamp)
         
         self.stats['lines_received'] += 1
     
     def send_via_scp(self):
         if not self.config['remote']['enabled']:
             return
-    
+        
         try:
             target = self.config['remote']['scp_target'].rstrip('/')
-            # Разделяем строку "user@host:/path" на host и путь
             if ':' not in target:
-                print("ERROR: invalid scp_target format, expected user@host:/path")
+                print("ERROR: invalid scp_target format")
                 return
             host_part, path_part = target.split(':', 1)
             key = self.config['remote']['ssh_key_path']
             device_name = os.uname().nodename
-    
+            
+            any_sent = False
+            
             for src, cfg in self.config['sources'].items():
                 if not cfg.get('enabled', True):
                     continue
                 local_file = self.local_live_dir / f"{src}.log"
-                if not local_file.exists() or local_file.stat().st_size == 0:
+                if not local_file.exists():
                     continue
                 
-                # Путь к временному файлу на сервере (только путь, без хоста)
-                temp_remote_path = f"{path_part}/temp_{device_name}_{src}.log"
-                # Целевая директория и файл
+                current_size = local_file.stat().st_size
+                last_pos = self.send_positions.get(src, 0)
+                
+                # Если файл уменьшился (ротация внешняя) – сбросить позицию
+                if current_size < last_pos:
+                    last_pos = 0
+                
+                if current_size <= last_pos:
+                    continue  # Нет новых данных
+                
+                # Читаем новые данные
+                with open(local_file, 'r') as f:
+                    f.seek(last_pos)
+                    new_data = f.read()
+                
+                if not new_data:
+                    continue
+                
+                # Создаём локальный временный файл только с новыми данными
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.log') as tmp:
+                    tmp.write(new_data)
+                    tmp_path = tmp.name
+                
+                # Целевая директория и файл на сервере
                 target_dir = f"{path_part}/{device_name}"
                 target_file = f"{target_dir}/{src}.log"
-    
-                # Копируем локальный файл на сервер во временный
+                
+                # Копируем временный файл на сервер во временное имя
+                temp_remote = f"{path_part}/temp_{device_name}_{src}_{int(time.time())}.log"
                 scp_cmd = ['scp', '-i', key, '-o', 'ConnectTimeout=10',
-                           str(local_file), f"{host_part}:{temp_remote_path}"]
-                result = subprocess.run(scp_cmd, capture_output=True, timeout=30)
-                if result.returncode != 0:
-                    print(f"SCP copy failed for {src}: {result.stderr.decode()}")
+                           tmp_path, f"{host_part}:{temp_remote}"]
+                res = subprocess.run(scp_cmd, capture_output=True, timeout=30)
+                os.unlink(tmp_path)
+                
+                if res.returncode != 0:
+                    print(f"SCP copy failed for {src}: {res.stderr.decode()}")
                     self.stats['scp_failed'] += 1
                     continue
                 
-                # Создаём целевую директорию, дописываем временный файл в целевой, удаляем временный
-                ssh_cmd = [
-                    'ssh', '-i', key, '-o', 'ConnectTimeout=10', host_part,
-                    f'mkdir -p {target_dir} && cat {temp_remote_path} >> {target_file} && rm {temp_remote_path}'
-                ]
-                result = subprocess.run(ssh_cmd, capture_output=True, timeout=30)
-                if result.returncode == 0:
-                    print(f"Appended {local_file.stat().st_size} bytes to {device_name}/{src}.log")
+                # Дописываем временный файл в целевой и удаляем его
+                ssh_cmd = ['ssh', '-i', key, '-o', 'ConnectTimeout=10', host_part,
+                           f'mkdir -p {target_dir} && cat {temp_remote} >> {target_file} && rm {temp_remote}']
+                res = subprocess.run(ssh_cmd, capture_output=True, timeout=30)
+                
+                if res.returncode == 0:
+                    print(f"Sent {len(new_data)} new bytes to {device_name}/{src}.log (pos {last_pos} -> {current_size})")
+                    self.send_positions[src] = current_size
                     self.stats['scp_sent'] += 1
+                    any_sent = True
                 else:
-                    print(f"Append failed for {src}: {result.stderr.decode()}")
+                    print(f"Append failed for {src}: {res.stderr.decode()}")
                     self.stats['scp_failed'] += 1
-    
-                # Если нужно очистить локальный файл после отправки
-                if self.config['remote'].get('cleanup_after_send', False):
-                    self.current_files[src].close()
-                    local_file.unlink()
-                    self.current_files[src] = open(local_file, 'a')
-                    self.current_sizes[src] = 0
-    
+            
+            if any_sent:
+                self.save_send_positions()
+            
         except Exception as e:
             self.stats['scp_failed'] += 1
             print(f"SCP error: {e}")
     
     def emergency_flush(self):
         for fd in self.current_files.values():
-            fd.flush()
+            if fd and not fd.closed:
+                fd.flush()
+        self.save_send_positions()
         emergency = self.local_archive_dir / f"EMERGENCY_{int(time.time())}.log"
         with open(emergency, 'w') as f:
             f.write(f"=== EMERGENCY {datetime.now()} ===\n")
@@ -225,17 +279,14 @@ class AppendSCPLogCollector:
         print(f"Watching {src} -> {path}")
         try:
             f = open(path, 'r')
-            # Сначала прочитаем все существующие строки
-            f.seek(0, os.SEEK_SET)
+            # Прочитать уже существующие строки (для начального заполнения live-файла)
             for line in f:
                 if line.strip():
                     self.write_log(src, line.strip())
-            # Затем перейдём в конец для отслеживания новых
             f.seek(0, os.SEEK_END)
             while self.running:
                 line = f.readline()
                 if line:
-                    print(f"DEBUG: read line from {src}: {line[:50]}")
                     self.write_log(src, line.strip())
                 else:
                     time.sleep(0.1)
@@ -258,15 +309,17 @@ class AppendSCPLogCollector:
             self.write_log(src, line.decode().strip())
     
     def start_background_tasks(self):
-        # Flush thread
         def flush_worker():
             while self.running:
                 time.sleep(self.config['buffer']['flush_interval_seconds'])
-                for fd in self.current_files.values():
-                    fd.flush()
+                for src, fd in self.current_files.items():
+                    if fd and not fd.closed:
+                        try:
+                            fd.flush()
+                        except Exception as e:
+                            print(f"Flush error for {src}: {e}")
         threading.Thread(target=flush_worker, daemon=True).start()
         
-        # SCP sender thread
         def scp_worker():
             while self.running:
                 interval = self.config['remote'].get('send_interval_minutes', 5) * 60
@@ -275,7 +328,6 @@ class AppendSCPLogCollector:
                     self.send_via_scp()
         threading.Thread(target=scp_worker, daemon=True).start()
         
-        # Start watchers
         for src, cfg in self.config['sources'].items():
             if not cfg.get('enabled', True):
                 continue
@@ -288,7 +340,7 @@ class AppendSCPLogCollector:
                 threading.Thread(target=self.watch_command, args=(src, cmd), daemon=True).start()
     
     def run(self):
-        print("=== SCP Log Collector Started ===")
+        print("=== SCP Log Collector (incremental) Started ===")
         print(f"Live dir: {self.local_live_dir}")
         print(f"SCP target: {self.config['remote']['scp_target']}")
         last_status = time.time()
@@ -296,16 +348,16 @@ class AppendSCPLogCollector:
             while self.running:
                 time.sleep(1)
                 if time.time() - last_status > 60:
-                    print(f"[Status] lines: {self.stats['lines_received']} recv, "
-                          f"rotations: {self.stats['rotations']}, "
-                          f"SCP ok/fail: {self.stats['scp_sent']}/{self.stats['scp_failed']}")
+                    print(f"[Status] lines: {self.stats['lines_received']} recv, rotations: {self.stats['rotations']}, SCP ok/fail: {self.stats['scp_sent']}/{self.stats['scp_failed']}")
                     last_status = time.time()
         except KeyboardInterrupt:
             pass
         finally:
+            self.save_send_positions()
             self.emergency_flush()
             for fd in self.current_files.values():
-                fd.close()
+                if fd and not fd.closed:
+                    fd.close()
 
 if __name__ == "__main__":
     collector = AppendSCPLogCollector()
