@@ -25,7 +25,7 @@
   },
   "remote": {
     "enabled": true,
-    "scp_target": "loguser@172.16.12.51:/home/loguser/device_logs/",
+    "scp_target": "",
     "ssh_key_path": "/root/.ssh/id_dropbear_rsa",
     "send_interval_minutes": 5,
     "cleanup_after_send": false
