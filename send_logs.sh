@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ---- Конфигурация ----
-LOG_DIR="/var/log/"          # Ваши прикладные логи
+LOG_DIR="/var/log/"          
 TEMP_DIR="/tmp/remote_logs"        # Временная папка для сбора системных логов
 REMOTE_USER="loguser"
 REMOTE_HOST="172.16.12.51"
@@ -23,7 +23,6 @@ journalctl --since "1 hour ago" --no-pager > "$TEMP_DIR/journalctl.log"
 # ---- Если нужен полный журнал (осторожно, большой) ----
 # journalctl --no-pager > "$TEMP_DIR/journalctl_full.log"
 
-# ---- (Опционально) Добавляем логи загрузки ----
 journalctl -b 0 --no-pager > "$TEMP_DIR/journalctl_boot.log"
 
 # ---- Запуск rsync: синхронизируем оба источника ----
