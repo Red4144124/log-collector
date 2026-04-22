@@ -1,7 +1,5 @@
 #!/bin/bash
-# /usr/local/bin/sync-logs-rsync.sh
-# Каждый запуск создаёт на сервере: device_logs/rsync/имя_устройства/YYYYMMDD_HHMMSS/
-# Внутри — все логи, собранные в этот момент
+# /usr/local/bin/send_logs.sh
 
 REMOTE_USER="loguser"
 REMOTE_HOST="172.16.12.51"
@@ -26,8 +24,6 @@ mkdir -p "$WORK_DIR"
 dmesg > "${WORK_DIR}/dmesg.log"
 journalctl --since "5 minutes ago" --no-pager > "${WORK_DIR}/journalctl.log"
 
-# ---- Копирование пользовательских логов (без добавления метки в имя) ----
-# Имена файлов остаются оригинальными, т.к. папка уже имеет метку времени
 for logfile in kernel.log syslog auth.log \
                gst_demo.log hls_stream.log \
                main_web_server.log main_web_server_image_encoder.log \
