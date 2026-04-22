@@ -2,7 +2,7 @@
 # /usr/local/bin/send_logs.sh
 
 REMOTE_USER="loguser"
-REMOTE_HOST="172.16.12.51"
+REMOTE_HOST=""
 REMOTE_BASE="/home/loguser/device_logs/rsync/$(hostname)/"
 SSH_KEY="/root/.ssh/id_dropbear_rsa"
 
