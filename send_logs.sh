@@ -1,37 +1,45 @@
 #!/bin/bash
+# /usr/local/bin/sync-logs-rsync.sh
+# Каждый запуск создаёт на сервере: device_logs/rsync/имя_устройства/YYYYMMDD_HHMMSS/
+# Внутри — все логи, собранные в этот момент
 
-# ---- Конфигурация ----
-LOG_DIR="/var/log/"          
-TEMP_DIR="/tmp/remote_logs"        # Временная папка для сбора системных логов
 REMOTE_USER="loguser"
 REMOTE_HOST="172.16.12.51"
-REMOTE_PATH="/home/loguser/device_logs/rsync/$(hostname)/"
+REMOTE_BASE="/home/loguser/device_logs/rsync/$(hostname)/"
 SSH_KEY="/root/.ssh/id_dropbear_rsa"
 
-# ---- Создаём временную папку для сбора логов ----
-rm -rf "$TEMP_DIR"
-mkdir -p "$TEMP_DIR"
+# Используем SD-карту для временных файлов
+WORK_BASE="/media/card/logs_upload"
+mkdir -p "$WORK_BASE"
 
-# ---- Сохраняем dmesg (кольцевой буфер ядра) ----
-dmesg > "$TEMP_DIR/dmesg.log"
+# Проверка монтирования SD-карты
+if ! mountpoint -q /media/card; then
+    echo "$(date): SD card not mounted, exiting" >> /var/log/sync-logs.log
+    exit 1
+fi
 
-# ---- Сохраняем journalctl (системный журнал) ----
-# --since "1 hour ago"  - можно ограничить период, чтобы файл не разрастался
-# --no-pager            - отключаем постраничный вывод
-journalctl --since "1 hour ago" --no-pager > "$TEMP_DIR/journalctl.log"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+WORK_DIR="${WORK_BASE}/remote_logs_${TIMESTAMP}"
+mkdir -p "$WORK_DIR"
 
-# ---- Если нужен полный журнал (осторожно, большой) ----
-# journalctl --no-pager > "$TEMP_DIR/journalctl_full.log"
+# ---- Генерация дампов ----
+dmesg > "${WORK_DIR}/dmesg.log"
+journalctl --since "5 minutes ago" --no-pager > "${WORK_DIR}/journalctl.log"
 
-journalctl -b 0 --no-pager > "$TEMP_DIR/journalctl_boot.log"
+# ---- Копирование пользовательских логов (без добавления метки в имя) ----
+# Имена файлов остаются оригинальными, т.к. папка уже имеет метку времени
+for logfile in kernel.log syslog auth.log \
+               gst_demo.log hls_stream.log \
+               main_web_server.log main_web_server_image_encoder.log \
+               sys_settings.log; do
+    [ -f "/var/log/$logfile" ] && cp "/var/log/$logfile" "${WORK_DIR}/"
+done
 
-# ---- Запуск rsync: синхронизируем оба источника ----
-# Синхронизируем прикладные логи и временную папку с системными логами
-rsync -avz --delete \
+# ---- Отправка на сервер (создаётся папка с TIMESTAMP) ----
+rsync -avz --ignore-existing --mkpath \
     -e "dbclient -i $SSH_KEY -y" \
-    "$LOG_DIR" \
-    "$TEMP_DIR/" \
-    "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH"
+    "$WORK_DIR/" \
+    "$REMOTE_USER@$REMOTE_HOST:${REMOTE_BASE}${TIMESTAMP}/"
 
-# ---- Очистка временной папки (опционально) ----
-rm -rf "$TEMP_DIR"
+# ---- Очистка временной папки на SD-карте ----
+rm -rf "$WORK_DIR"
